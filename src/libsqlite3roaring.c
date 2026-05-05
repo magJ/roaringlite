@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <string.h>
 #include <sqlite3ext.h>
 #include "roaring.c"
 SQLITE_EXTENSION_INIT1
@@ -1226,14 +1227,41 @@ static void roaring64LengthFunc(
   sqlite3_result_int64(context, nSize);
 }
 
+/*
+** Cache struct for rb_contains / rb64_contains.
+**
+** sqlite3_set_auxdata is a no-op when the bitmap argument is not a direct
+** physical-column reference (CTE columns, subquery results, expressions).
+** To cache across those call sites we store a single-entry cache as the
+** function's pApp user-data, keyed by blob address + length + a 32-byte
+** content prefix.  The prefix covers the full blob for small bitmaps and
+** provides a near-collision-free guard against cross-statement pointer reuse
+** for large ones.
+*/
+#define RB_CACHE_PREFIX 32
+typedef struct {
+  const void *pBlob;
+  int         nBlob;
+  unsigned char aPrefix[RB_CACHE_PREFIX];
+  void       *bm;   /* roaring_bitmap_t* or roaring64_bitmap_t*, owned here */
+} RbContainsCache;
+
+static void freeRbContainsCache(void *p){
+  RbContainsCache *c = (RbContainsCache*)p;
+  if( c->bm ) roaring_bitmap_free((roaring_bitmap_t*)c->bm);
+  sqlite3_free(c);
+}
+
+static void freeRb64ContainsCache(void *p){
+  RbContainsCache *c = (RbContainsCache*)p;
+  if( c->bm ) roaring64_bitmap_free((roaring64_bitmap_t*)c->bm);
+  sqlite3_free(c);
+}
+
 /* ── rb_contains(bitmap BLOB, value INTEGER) → 0|1 ──────────────────────────
 **
 ** Returns 1 if value is present in the bitmap, 0 otherwise.
 ** Returns 0 for NULL bitmap, 0 for out-of-range values (< 0 or > UINT32_MAX).
-**
-** Caches the deserialized bitmap in SQLite auxdata against argument 0 so
-** that repeated calls within the same prepared statement only deserialize
-** the bitmap once.
 **
 ** Usage: SELECT rb_contains(bitmap_blob, value)
 */
@@ -1256,16 +1284,25 @@ static void rbContainsFunc(
     sqlite3_result_int(ctx, 0);
     return;
   }
-  roaring_bitmap_t *bm = (roaring_bitmap_t*)sqlite3_get_auxdata(ctx, 0);
-  if( !bm ){
-    bm = roaring_bitmap_deserialize_safe(
-      sqlite3_value_blob(argv[0]),
-      (size_t)sqlite3_value_bytes(argv[0]));
+  const void *pBlob = sqlite3_value_blob(argv[0]);
+  int nBlob = sqlite3_value_bytes(argv[0]);
+  int nPrefix = nBlob < RB_CACHE_PREFIX ? nBlob : RB_CACHE_PREFIX;
+  RbContainsCache *pc = (RbContainsCache*)sqlite3_user_data(ctx);
+  roaring_bitmap_t *bm;
+  if( pc->bm && pc->pBlob==pBlob && pc->nBlob==nBlob &&
+      memcmp(pc->aPrefix, pBlob, nPrefix)==0 ){
+    bm = (roaring_bitmap_t*)pc->bm;
+  } else {
+    bm = roaring_bitmap_deserialize_safe(pBlob, (size_t)nBlob);
     if( !bm ){
       sqlite3_result_error(ctx, "rb_contains: invalid bitmap", -1);
       return;
     }
-    sqlite3_set_auxdata(ctx, 0, bm, (void(*)(void*))roaring_bitmap_free);
+    if( pc->bm ) roaring_bitmap_free((roaring_bitmap_t*)pc->bm);
+    pc->bm = bm;
+    pc->pBlob = pBlob;
+    pc->nBlob = nBlob;
+    memcpy(pc->aPrefix, pBlob, nPrefix);
   }
   sqlite3_result_int(ctx, roaring_bitmap_contains(bm, (uint32_t)v));
 }
@@ -1294,16 +1331,25 @@ static void rb64ContainsFunc(
     sqlite3_result_int(ctx, 0);
     return;
   }
-  roaring64_bitmap_t *bm = (roaring64_bitmap_t*)sqlite3_get_auxdata(ctx, 0);
-  if( !bm ){
-    bm = roaring64_bitmap_portable_deserialize_safe(
-      sqlite3_value_blob(argv[0]),
-      (size_t)sqlite3_value_bytes(argv[0]));
+  const void *pBlob = sqlite3_value_blob(argv[0]);
+  int nBlob = sqlite3_value_bytes(argv[0]);
+  int nPrefix = nBlob < RB_CACHE_PREFIX ? nBlob : RB_CACHE_PREFIX;
+  RbContainsCache *pc = (RbContainsCache*)sqlite3_user_data(ctx);
+  roaring64_bitmap_t *bm;
+  if( pc->bm && pc->pBlob==pBlob && pc->nBlob==nBlob &&
+      memcmp(pc->aPrefix, pBlob, nPrefix)==0 ){
+    bm = (roaring64_bitmap_t*)pc->bm;
+  } else {
+    bm = roaring64_bitmap_portable_deserialize_safe(pBlob, (size_t)nBlob);
     if( !bm ){
       sqlite3_result_error(ctx, "rb64_contains: invalid bitmap", -1);
       return;
     }
-    sqlite3_set_auxdata(ctx, 0, bm, (void(*)(void*))roaring64_bitmap_free);
+    if( pc->bm ) roaring64_bitmap_free((roaring64_bitmap_t*)pc->bm);
+    pc->bm = bm;
+    pc->pBlob = pBlob;
+    pc->nBlob = nBlob;
+    memcpy(pc->aPrefix, pBlob, nPrefix);
   }
   sqlite3_result_int(ctx, roaring64_bitmap_contains(bm, (uint64_t)v));
 }
@@ -2038,7 +2084,12 @@ int sqlite3_roaring_init(
   rc = sqlite3_create_function(db, "rb_or_count", 2, flags, 0, roaringOrLengthFunc, 0, 0);
   rc = sqlite3_create_function(db, "rb_not_count", 2, flags, 0, roaringNotLengthFunc, 0, 0);
   rc = sqlite3_create_function(db, "rb_xor_count", 2, flags, 0, roaringXorLengthFunc, 0, 0);
-  rc = sqlite3_create_function(db, "rb_contains", 2, flags, 0, rbContainsFunc, 0, 0);
+  {
+    RbContainsCache *p = sqlite3_malloc(sizeof(RbContainsCache));
+    if( !p ) return SQLITE_NOMEM;
+    memset(p, 0, sizeof(RbContainsCache));
+    rc = sqlite3_create_function_v2(db, "rb_contains", 2, flags, p, rbContainsFunc, 0, 0, freeRbContainsCache);
+  }
 
   // 64-bit scalar functions
   rc = sqlite3_create_function(db, "rb64_create", -1, flags, 0, roaring64CreateFunc, 0, 0);
@@ -2053,7 +2104,12 @@ int sqlite3_roaring_init(
   rc = sqlite3_create_function(db, "rb64_or_count", 2, flags, 0, roaring64OrLengthFunc, 0, 0);
   rc = sqlite3_create_function(db, "rb64_not_count", 2, flags, 0, roaring64NotLengthFunc, 0, 0);
   rc = sqlite3_create_function(db, "rb64_xor_count", 2, flags, 0, roaring64XorLengthFunc, 0, 0);
-  rc = sqlite3_create_function(db, "rb64_contains", 2, flags, 0, rb64ContainsFunc, 0, 0);
+  {
+    RbContainsCache *p = sqlite3_malloc(sizeof(RbContainsCache));
+    if( !p ) return SQLITE_NOMEM;
+    memset(p, 0, sizeof(RbContainsCache));
+    rc = sqlite3_create_function_v2(db, "rb64_contains", 2, flags, p, rb64ContainsFunc, 0, 0, freeRb64ContainsCache);
+  }
 
   //rc = sqlite3_create_function(db, "rb_and_many", -1, flags, 0, roaringAndManyFunc, 0, 0);
   //rc = sqlite3_create_function(db, "rb_or_many", -1, flags, 0, roaringOrManyFunc, 0, 0);

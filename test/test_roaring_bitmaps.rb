@@ -387,6 +387,38 @@ class TestRoaringBitmap < Minitest::Test
     assert_equal 5, result
   end
 
+  def test_rb_contains_cte_path
+    # CTE result is not a direct column reference; pApp cache must serve the
+    # same bitmap across many rows without re-deserializing each time.
+    DB.execute("CREATE TEMP TABLE ids2(id INTEGER PRIMARY KEY)")
+    DB.execute("INSERT INTO ids2 SELECT value FROM rb_each(rb_create(1,2,3,4,5,6,7,8,9,10))")
+    result = DB.query_single_splat(
+      "WITH bm(b) AS (SELECT rb_create(2,4,6,8,10)) " \
+      "SELECT count(*) FROM ids2, bm WHERE rb_contains(bm.b, ids2.id)"
+    )
+    DB.execute("DROP TABLE temp.ids2")
+    assert_equal 5, result
+  end
+
+  def test_rb_contains_cross_statement_safety
+    # Two statements that may land bitmaps at the same address must not cross-contaminate.
+    r1 = DB.query_single_splat("SELECT rb_contains(rb_create(1,2,3), 2)")
+    r2 = DB.query_single_splat("SELECT rb_contains(rb_create(7,8,9), 2)")
+    assert_equal 1, r1
+    assert_equal 0, r2
+  end
+
+  def test_rb64_contains_cte_path
+    DB.execute("CREATE TEMP TABLE ids3(id INTEGER PRIMARY KEY)")
+    DB.execute("INSERT INTO ids3 SELECT value FROM rb64_each(rb64_create(1,2,3,4,5,6,7,8,9,10))")
+    result = DB.query_single_splat(
+      "WITH bm(b) AS (SELECT rb64_create(2,4,6,8,10)) " \
+      "SELECT count(*) FROM ids3, bm WHERE rb64_contains(bm.b, ids3.id)"
+    )
+    DB.execute("DROP TABLE temp.ids3")
+    assert_equal 5, result
+  end
+
   # ── rb_each ORDER BY value ASC ─────────────────────────────────────────────
 
   def test_rb_each_order_asc_values
