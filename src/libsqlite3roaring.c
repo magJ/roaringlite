@@ -2063,6 +2063,11 @@ static sqlite3_module rbRangeModule = {
 
 #endif /* SQLITE_OMIT_VIRTUALTABLE */
 
+#if defined(_WIN32)
+__declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("default")))
+#endif
 int sqlite3_roaring_init(
   sqlite3 *db,
   char **pzErrMsg,
