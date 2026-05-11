@@ -61,17 +61,17 @@ RUN zig cc -target aarch64-macos $CFLAGS -shared -fvisibility=hidden \
       -o /out/lib/roaringlite-macos-aarch64.dylib
 
 FROM base AS build-linux-x86_64
-RUN zig cc -target x86_64-linux $CFLAGS -shared -fvisibility=hidden \
+RUN zig cc -target x86_64-linux-gnu.2.28 $CFLAGS -shared -fvisibility=hidden \
       /build/sqlite/sqlite3.c -o /out/lib/libsqlite3-linux-x86_64.so \
- && zig cc -target x86_64-linux -O3 -shared -fPIC -fvisibility=hidden \
+ && zig cc -target x86_64-linux-gnu.2.28 -O3 -shared -fPIC -fvisibility=hidden \
       -I /build/sqlite -I /build/roaringlite/src \
       /build/roaringlite/src/libsqlite3roaring.c \
       -o /out/lib/roaringlite-linux-x86_64.so
 
 FROM base AS build-linux-aarch64
-RUN zig cc -target aarch64-linux $CFLAGS -shared -fvisibility=hidden \
+RUN zig cc -target aarch64-linux-gnu.2.28 $CFLAGS -shared -fvisibility=hidden \
       /build/sqlite/sqlite3.c -o /out/lib/libsqlite3-linux-aarch64.so \
- && zig cc -target aarch64-linux -O3 -shared -fPIC -fvisibility=hidden \
+ && zig cc -target aarch64-linux-gnu.2.28 -O3 -shared -fPIC -fvisibility=hidden \
       -I /build/sqlite -I /build/roaringlite/src \
       /build/roaringlite/src/libsqlite3roaring.c \
       -o /out/lib/roaringlite-linux-aarch64.so
