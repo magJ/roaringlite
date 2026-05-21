@@ -1363,9 +1363,8 @@ __declspec(dllexport)
 ** Table-valued function returning one row per integer in a roaring bitmap.
 **
 ** Supports ORDER BY value ASC and ORDER BY value DESC via orderByConsumed.
-** For ascending order, uses a fixed 4K-value staging buffer filled via
-** roaring_uint32_iterator_read (bulk, cache-friendly). For descending order,
-** uses roaring_iterator_init_last and roaring_uint32_iterator_previous.
+** Both directions use a 4K-value staging buffer: roaring_uint32_iterator_read
+** for ascending, roaring_uint32_iterator_read_backward for descending.
 **
 ** Usage:
 **   SELECT value FROM rb_each(bitmap_blob)
@@ -1396,7 +1395,7 @@ struct RbEachCursor {
   sqlite3_vtab_cursor       base;
   roaring_uint32_iterator_t it;       /* forward or reverse iterator (stack) */
   roaring_bitmap_t         *bm;
-  uint32_t                 *buf;      /* NULL in reverse mode */
+  uint32_t                 *buf;
   uint32_t                  cap;
   uint32_t                  nBuf;
   uint32_t                  iBuf;
@@ -1512,16 +1511,17 @@ static int rbEachFilter(
   card = roaring_bitmap_get_cardinality(pCur->bm);
   if( card==0 ) return SQLITE_OK;
 
+  pCur->cap = (uint32_t)(card < RB_EACH_CHUNK ? card : RB_EACH_CHUNK);
+  pCur->buf = (uint32_t*)sqlite3_malloc64(pCur->cap * sizeof(uint32_t));
+  if( !pCur->buf ){
+    roaring_bitmap_free(pCur->bm); pCur->bm = NULL;
+    return SQLITE_NOMEM;
+  }
   if( idxNum & RB_EACH_IDX_ORDER_DESC ){
     pCur->reverse = 1;
     roaring_iterator_init_last(pCur->bm, &pCur->it);
+    pCur->nBuf = roaring_uint32_iterator_read_backward(&pCur->it, pCur->buf, pCur->cap);
   } else {
-    pCur->cap = (uint32_t)(card < RB_EACH_CHUNK ? card : RB_EACH_CHUNK);
-    pCur->buf = (uint32_t*)sqlite3_malloc64(pCur->cap * sizeof(uint32_t));
-    if( !pCur->buf ){
-      roaring_bitmap_free(pCur->bm); pCur->bm = NULL;
-      return SQLITE_NOMEM;
-    }
     roaring_iterator_init(pCur->bm, &pCur->it);
     pCur->nBuf = roaring_uint32_iterator_read(&pCur->it, pCur->buf, pCur->cap);
   }
@@ -1534,13 +1534,11 @@ static int rbEachNext(sqlite3_vtab_cursor *cur){
     if( pCur->rowsLeft > 0 ) pCur->rowsLeft--;
     if( pCur->rowsLeft == 0 ) return SQLITE_OK;
   }
-  if( pCur->reverse ){
-    roaring_uint32_iterator_previous(&pCur->it);
-  } else {
-    if( ++pCur->iBuf >= pCur->nBuf ){
-      pCur->nBuf = roaring_uint32_iterator_read(&pCur->it, pCur->buf, pCur->cap);
-      pCur->iBuf = 0;
-    }
+  if( ++pCur->iBuf >= pCur->nBuf ){
+    pCur->nBuf = pCur->reverse
+      ? roaring_uint32_iterator_read_backward(&pCur->it, pCur->buf, pCur->cap)
+      : roaring_uint32_iterator_read(&pCur->it, pCur->buf, pCur->cap);
+    pCur->iBuf = 0;
   }
   return SQLITE_OK;
 }
@@ -1548,23 +1546,20 @@ static int rbEachNext(sqlite3_vtab_cursor *cur){
 static int rbEachEof(sqlite3_vtab_cursor *cur){
   RbEachCursor *pCur = (RbEachCursor *)cur;
   if( pCur->rowsLeft == 0 ) return 1;
-  if( pCur->reverse ) return !pCur->it.has_value;
   return pCur->nBuf == 0;
 }
 
 static int rbEachColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col){
   RbEachCursor *pCur = (RbEachCursor *)cur;
   if( col==0 ){
-    uint32_t v = pCur->reverse ? pCur->it.current_value : pCur->buf[pCur->iBuf];
-    sqlite3_result_int64(ctx, (sqlite3_int64)v);
+    sqlite3_result_int64(ctx, (sqlite3_int64)pCur->buf[pCur->iBuf]);
   }
   return SQLITE_OK;
 }
 
 static int rbEachRowid(sqlite3_vtab_cursor *cur, sqlite_int64 *pRowid){
   RbEachCursor *pCur = (RbEachCursor *)cur;
-  *pRowid = pCur->reverse ? (sqlite_int64)pCur->it.current_value
-                          : (sqlite_int64)pCur->buf[pCur->iBuf];
+  *pRowid = (sqlite_int64)pCur->buf[pCur->iBuf];
   return SQLITE_OK;
 }
 
@@ -1617,7 +1612,7 @@ struct Rb64EachCursor {
   sqlite3_vtab_cursor  base;
   roaring64_iterator_t *it;       /* heap-allocated; NULL until Filter */
   roaring64_bitmap_t   *bm;
-  uint64_t             *buf;      /* NULL in reverse mode */
+  uint64_t             *buf;
   uint32_t              cap;
   uint64_t              nBuf;
   uint64_t              iBuf;
@@ -1735,20 +1730,22 @@ static int rb64EachFilter(
   card = roaring64_bitmap_get_cardinality(pCur->bm);
   if( card==0 ) return SQLITE_OK;
 
+  pCur->cap = (uint32_t)(card < RB64_EACH_CHUNK ? (uint32_t)card : RB64_EACH_CHUNK);
+  pCur->buf = (uint64_t*)sqlite3_malloc64(pCur->cap * sizeof(uint64_t));
+  if( !pCur->buf ){
+    roaring64_bitmap_free(pCur->bm); pCur->bm = NULL;
+    return SQLITE_NOMEM;
+  }
   if( idxNum & RB_EACH_IDX_ORDER_DESC ){
     pCur->reverse = 1;
     pCur->it = roaring64_iterator_create_last(pCur->bm);
     if( !pCur->it ){
+      sqlite3_free(pCur->buf); pCur->buf = NULL;
       roaring64_bitmap_free(pCur->bm); pCur->bm = NULL;
       return SQLITE_NOMEM;
     }
+    pCur->nBuf = roaring64_iterator_read_backward(pCur->it, pCur->buf, pCur->cap);
   } else {
-    pCur->cap = (uint32_t)(card < RB64_EACH_CHUNK ? (uint32_t)card : RB64_EACH_CHUNK);
-    pCur->buf = (uint64_t*)sqlite3_malloc64(pCur->cap * sizeof(uint64_t));
-    if( !pCur->buf ){
-      roaring64_bitmap_free(pCur->bm); pCur->bm = NULL;
-      return SQLITE_NOMEM;
-    }
     pCur->it = roaring64_iterator_create(pCur->bm);
     if( !pCur->it ){
       sqlite3_free(pCur->buf); pCur->buf = NULL;
@@ -1766,13 +1763,11 @@ static int rb64EachNext(sqlite3_vtab_cursor *cur){
     if( pCur->rowsLeft > 0 ) pCur->rowsLeft--;
     if( pCur->rowsLeft == 0 ) return SQLITE_OK;
   }
-  if( pCur->reverse ){
-    roaring64_iterator_previous(pCur->it);
-  } else {
-    if( ++pCur->iBuf >= pCur->nBuf ){
-      pCur->nBuf = roaring64_iterator_read(pCur->it, pCur->buf, pCur->cap);
-      pCur->iBuf = 0;
-    }
+  if( ++pCur->iBuf >= pCur->nBuf ){
+    pCur->nBuf = pCur->reverse
+      ? roaring64_iterator_read_backward(pCur->it, pCur->buf, pCur->cap)
+      : roaring64_iterator_read(pCur->it, pCur->buf, pCur->cap);
+    pCur->iBuf = 0;
   }
   return SQLITE_OK;
 }
@@ -1780,25 +1775,20 @@ static int rb64EachNext(sqlite3_vtab_cursor *cur){
 static int rb64EachEof(sqlite3_vtab_cursor *cur){
   Rb64EachCursor *pCur = (Rb64EachCursor *)cur;
   if( pCur->rowsLeft == 0 ) return 1;
-  if( pCur->reverse ) return !roaring64_iterator_has_value(pCur->it);
   return pCur->nBuf == 0;
 }
 
 static int rb64EachColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col){
   Rb64EachCursor *pCur = (Rb64EachCursor *)cur;
   if( col==0 ){
-    uint64_t v = pCur->reverse ? roaring64_iterator_value(pCur->it)
-                               : pCur->buf[pCur->iBuf];
-    sqlite3_result_int64(ctx, (sqlite3_int64)v);
+    sqlite3_result_int64(ctx, (sqlite3_int64)pCur->buf[pCur->iBuf]);
   }
   return SQLITE_OK;
 }
 
 static int rb64EachRowid(sqlite3_vtab_cursor *cur, sqlite_int64 *pRowid){
   Rb64EachCursor *pCur = (Rb64EachCursor *)cur;
-  uint64_t v = pCur->reverse ? roaring64_iterator_value(pCur->it)
-                             : pCur->buf[pCur->iBuf];
-  *pRowid = (sqlite_int64)v;
+  *pRowid = (sqlite_int64)pCur->buf[pCur->iBuf];
   return SQLITE_OK;
 }
 
@@ -2013,6 +2003,13 @@ static int rbRangeFilter(
   card = roaring_bitmap_get_cardinality(pCur->bm);
   if( card==0 ) return SQLITE_OK;
 
+  pCur->cap = RB_EACH_CHUNK;
+  pCur->buf = (uint32_t*)sqlite3_malloc64(pCur->cap * sizeof(uint32_t));
+  if( !pCur->buf ){
+    roaring_bitmap_free(pCur->bm); pCur->bm = NULL;
+    return SQLITE_NOMEM;
+  }
+
   if( pCur->reverse ){
     roaring_iterator_init_last(pCur->bm, &pCur->it);
     if( offset>0 ){
@@ -2020,13 +2017,8 @@ static int rbRangeFilter(
       roaring_uint32_iterator_skip_backward(&pCur->it, sk);
       if( !pCur->it.has_value ) return SQLITE_OK;
     }
+    pCur->nBuf = roaring_uint32_iterator_read_backward(&pCur->it, pCur->buf, pCur->cap);
   } else {
-    pCur->cap = RB_EACH_CHUNK;
-    pCur->buf = (uint32_t*)sqlite3_malloc64(pCur->cap * sizeof(uint32_t));
-    if( !pCur->buf ){
-      roaring_bitmap_free(pCur->bm); pCur->bm = NULL;
-      return SQLITE_NOMEM;
-    }
     roaring_iterator_init(pCur->bm, &pCur->it);
     if( offset>0 ){
       uint32_t sk = (uint32_t)(offset < (sqlite3_int64)0xFFFFFFFFu ? offset : (sqlite3_int64)0xFFFFFFFFu);
